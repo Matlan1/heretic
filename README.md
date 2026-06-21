@@ -86,7 +86,7 @@ produced by competing abliteration tools:
 [2](https://old.reddit.com/r/LocalLLaMA/comments/1sy18lx/abliterlitics_benchmarks_and_tensor_comparison/).
 
 The community has created and published
-[well over 3000](https://huggingface.co/models?other=heretic)
+[well over 4000](https://huggingface.co/models?other=heretic)
 models with Heretic.
 
 

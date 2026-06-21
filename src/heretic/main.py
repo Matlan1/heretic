@@ -6,6 +6,13 @@
 import os
 import sys
 
+# Ensure standard output/error use UTF-8 instead of system default charmap (e.g. cp1252 on Windows).
+for stream in (sys.stdout, sys.stderr):
+    if (
+        hasattr(stream, "reconfigure")
+        and (getattr(stream, "encoding", "") or "").lower() != "utf-8"
+    ):
+        stream.reconfigure(encoding="utf-8")  # type: ignore
 if sys.platform == "win32":
     # Reconfigure stdout/stderr to UTF-8 for Windows terminals that default to cp1252.
     try:
@@ -653,7 +660,7 @@ def obtain_export_strategy(
     if settings.quantization == QuantizationMethod.BNB_4BIT:
         print()
         print(
-            "Model was loaded with quantization. Merging requires reloading the base model."
+            "The model was loaded with quantization. Merging requires reloading the base model."
         )
         print(
             "[yellow]WARNING: CPU merging requires dequantizing the entire model to system RAM.[/]"
@@ -667,6 +674,10 @@ def obtain_export_strategy(
             print(
                 "[yellow]Rule of thumb: You need approximately 3x the parameter count in GB RAM.[/]"
             )
+            print(
+                "[yellow]Example: A 27B model requires ~80GB RAM. A 70B model requires ~200GB RAM.[/]"
+            )
+
         else:
             try:
                 # Estimate memory requirements by loading the model structure on the "meta" device.
@@ -702,10 +713,10 @@ def obtain_export_strategy(
         print()
 
     strategy = prompt_select(
-        "How do you want to proceed?",
+        "How do you want to export the model?",
         choices=[
             Choice(
-                title="Merge LoRA into full model"
+                title="Merge the abliteration LoRA and export the full model"
                 + (
                     ""
                     if settings.quantization == QuantizationMethod.NONE
@@ -714,7 +725,7 @@ def obtain_export_strategy(
                 value=ExportStrategy.MERGE,
             ),
             Choice(
-                title="Save LoRA adapter only (can be merged later)",
+                title="Export the abliteration LoRA only (can be merged later)",
                 value=ExportStrategy.ADAPTER,
             ),
         ],
@@ -730,6 +741,16 @@ def run():
         and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
     ):
         os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+    # Modified "Pagga" font from https://budavariam.github.io/asciiart-text/
+    print(f"[cyan]█░█░█▀▀░█▀▄░█▀▀░▀█▀░█░█▀▀[/]  v{version('heretic-llm')}")
+    print(
+        "[cyan]█▀█░█▀▀░█▀▄░█▀▀░░█░░█░█░░[/]  [blue underline]https://heretic-project.org[/]"
+    )
+    print(
+        "[cyan]▀░▀░▀▀▀░▀░▀░▀▀▀░░▀░░▀░▀▀▀[/]  [blue underline]https://github.com/p-e-w/heretic[/]"
+    )
+    print()
 
     if (
         # There is at least one argument (argv[0] is the program name).
@@ -759,9 +780,9 @@ def run():
     except ValidationError as error:
         print(f"[red]Configuration contains [bold]{error.error_count()}[/] errors:[/]")
 
-        for error_detail in error.errors():
+        for error_details in error.errors():
             print(
-                f"[bold]{error_detail['loc'][0]}[/]: [yellow]{error_detail['msg']}[/]"
+                f"[bold]{error_details['loc'][0]}[/]: [yellow]{error_details['msg']}[/]"
             )
 
         print()
@@ -968,9 +989,10 @@ def run():
 
                 formatted = format_exception(error)
                 if "\n" in formatted:
-                    print(f"[red]Failed[/]:\n{formatted}")
+                    print(f"[red]Failed:\n{formatted}[/]")
                 else:
-                    print(f"[red]Failed[/] ({formatted})")
+                    print(f"[red]Failed ({formatted})[/]")
+
                 break
 
             response_lengths = [
@@ -1147,10 +1169,22 @@ def run():
             # The parameter ranges are based on experiments with various models
             # and much wider ranges. They are not set in stone and might have to be
             # adjusted for future models.
-            max_weight = trial.suggest_float(
-                f"{component}.max_weight",
-                0.8,
-                1.5,
+            #
+            # The MLP gets a negative lower bound that is then clamped to 0, so the
+            # optimizer can fully disable its ablation. The clamp puts a positive
+            # probability mass on exactly 0 (the continuous sampler would otherwise
+            # reach 0 with probability zero). Ablating the MLP is often unnecessary for
+            # removing refusals and tends to damage model intelligence more than
+            # ablating the attention output, so on many models the optimum is to leave
+            # it (mostly) untouched. See issue #202.
+            max_weight_lower_bound = -0.25 if component == "mlp.down_proj" else 0.8
+            max_weight = max(
+                0.0,
+                trial.suggest_float(
+                    f"{component}.max_weight",
+                    max_weight_lower_bound,
+                    1.5,
+                ),
             )
             max_weight_position = trial.suggest_float(
                 f"{component}.max_weight_position",
@@ -1371,7 +1405,7 @@ def run():
                     if n_additional_trials == 0:
                         continue
 
-                    settings.n_trials += n_additional_trials
+                    settings.n_trials = len(study.trials) + n_additional_trials
                     study.set_user_attr("settings", settings.model_dump_json())
                     study.set_user_attr("finished", False)
 
@@ -1397,9 +1431,10 @@ def run():
             for name, value in get_trial_parameters(trial).items():
                 print(f"  * {name} = [bold]{value}[/]")
 
-            # Per https://github.com/huggingface/peft/issues/868#issuecomment-1820642893 once a LoRA is merged it's
-            # expected to be empty. Provide a utility function to restore the previous LoRA-ified state.
-            def reset_trial_model() -> None:
+            # Per https://github.com/huggingface/peft/issues/868#issuecomment-1820642893
+            # once a LoRA is merged it's expected to be empty. Provide a utility function
+            # to restore the previous LoRA-ified state.
+            def reset_trial_model():
                 print("* Resetting model...")
                 model.reset_model()
                 print("* Abliterating...")
@@ -1872,7 +1907,7 @@ def run():
                 except Exception as error:
                     formatted = format_exception(error)
                     if "\n" in formatted:
-                        print(f"[red]Error:[/]\n{formatted}")
+                        print(f"[red]Error:\n{formatted}[/]")
                     else:
                         print(f"[red]Error: {formatted}[/]")
 
