@@ -2,9 +2,9 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 from enum import Enum
-from typing import Dict
+from typing import Any, Dict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import (
     BaseSettings,
     CliSettingsSource,
@@ -37,10 +37,33 @@ class ExportStrategy(str, Enum):
     ADAPTER = "adapter"
 
 
+def clean_hf_repo_id(v: str) -> str:
+    import re
+
+    # Matches:
+    # https://huggingface.co/datasets/namespace/name
+    # https://huggingface.co/namespace/name
+    # huggingface.co/namespace/name
+    m = re.match(
+        r"^(?:https?://)?(?:www\.)?huggingface\.co/(?:datasets/)?([^/]+/[^/]+)(?:/.*)?$",
+        v,
+    )
+    if m:
+        return m.group(1)
+    return v
+
+
 class DatasetSpecification(BaseModel):
     dataset: str = Field(
         description="Hugging Face dataset ID, or path to dataset on disk."
     )
+
+    @field_validator("dataset", mode="before")
+    @classmethod
+    def clean_dataset(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return clean_hf_repo_id(v)
+        return v
 
     commit: str | None = Field(
         default=None,
@@ -100,9 +123,25 @@ class BenchmarkSpecification(BaseModel):
 class Settings(BaseSettings):
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
 
+    @field_validator("model", "evaluate_model", mode="before")
+    @classmethod
+    def clean_model(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return clean_hf_repo_id(v)
+        return v
+
     model_commit: str | None = Field(
         default=None,
         description="Hugging Face commit hash of the model.",
+    )
+
+    gguf_file: str | None = Field(
+        default=None,
+        description=(
+            "Name of the GGUF file to load from the model repository or directory. "
+            "Enables loading models distributed in GGUF format, which are dequantized "
+            "on load. Detected automatically if the model path ends in '.gguf'."
+        ),
     )
 
     evaluate_model: str | None = Field(
@@ -169,6 +208,16 @@ class Settings(BaseSettings):
     max_memory: Dict[str, str] | None = Field(
         default=None,
         description='Maximum memory to allocate per device (e.g., { "0" = "20GB", "cpu" = "64GB" }).',
+    )
+
+    offload_folder: str | None = Field(
+        default=None,
+        description=(
+            "Directory used by Accelerate to offload model weights to disk when they "
+            "do not fit in GPU and CPU memory. Defaults to an 'offload' folder in the "
+            "working directory. Disk offload lets very large models load, but is slow, "
+            "so prefer a model that fits in memory when possible."
+        ),
     )
 
     offload_outputs_to_cpu: bool = Field(
@@ -426,6 +475,28 @@ class Settings(BaseSettings):
     max_shard_size: int | str = Field(
         default="5GB",
         description="Maximum size for individual safetensors files generated when exporting a model.",
+    export_gguf: bool = Field(
+        default=False,
+        description=(
+            "Whether to also convert the abliterated model to GGUF format after saving, "
+            "using llama.cpp's conversion script."
+        ),
+    )
+
+    gguf_export_type: str = Field(
+        default="q8_0",
+        description=(
+            "Quantization type for the exported GGUF file when export_gguf is enabled "
+            "(e.g. 'f16', 'q8_0', 'q4_k_m')."
+        ),
+    )
+
+    llama_cpp_path: str | None = Field(
+        default=None,
+        description=(
+            "Path to a llama.cpp checkout or its convert_hf_to_gguf.py script, used when "
+            "export_gguf is enabled. Common locations and PATH are searched if not set."
+        ),
     )
 
     refusal_markers: list[str] = Field(

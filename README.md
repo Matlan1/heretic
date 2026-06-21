@@ -1,8 +1,17 @@
 <img width="128" align="right" alt="Logo" src="https://github.com/user-attachments/assets/df5f2840-2f92-4991-aa57-252747d7182e" />
 
-# Heretic: Fully automatic censorship removal for language models<br><br>[![Discord](https://img.shields.io/discord/1447831134212984903?color=5865F2&label=discord&labelColor=black&logo=discord&logoColor=white&style=for-the-badge)](https://discord.gg/gdXc48gSyT) [![Matrix](https://img.shields.io/badge/Matrix-black?logo=matrix&style=for-the-badge)](https://matrix.to/#/#heretic:matrix.org) [![Follow us on Hugging Face](https://huggingface.co/datasets/huggingface/badges/resolve/main/follow-us-on-hf-md-dark.svg)](https://huggingface.co/heretic-org) [![Codeberg mirror](https://img.shields.io/badge/Codeberg%20mirror-black?logo=codeberg&style=for-the-badge)](https://codeberg.org/p-e-w/heretic)
+# Heretic (Windows & AMD ROCm Fork)<br><br>[![Discord](https://img.shields.io/discord/1447831134212984903?color=5865F2&label=discord&labelColor=black&logo=discord&logoColor=white&style=for-the-badge)](https://discord.gg/gdXc48gSyT) [![Follow us on Hugging Face](https://huggingface.co/datasets/huggingface/badges/resolve/main/follow-us-on-hf-md-dark.svg)](https://huggingface.co/heretic-org)
 
-[![#1 Repository of the Day](https://trendshift.io/api/badge/repositories/20538)](https://trendshift.io/repositories/20538)
+> [!NOTE]
+> **Windows & AMD GPU (RDNA 2/3/4) Fork**
+> This repository is a fork of the original [heretic](https://github.com/p-e-w/heretic) project, modified to run natively on **Windows 11** with **AMD RDNA2, RDNA3, and RDNA4 GPUs** via ROCm/HIP.
+>
+> **What this fork adds:**
+> - **Native Windows ROCm support** - works out of the box on RX 6000, RX 7000, and RX 9000 series GPUs.
+> - **Interactive first-run setup** - on first launch, heretic detects your AMD GPU and asks whether to run ROCm setup automatically. Choosing **Y** opens a setup window that detects your GPU generation, installs the matching ROCm PyTorch and SDK wheels, patches `bitsandbytes`, then relaunches heretic in your original terminal. You can also trigger setup manually at any time with `uv run python scripts/setup_rocm.py`.
+> - **Hugging Face URL parsing** - pass a full `https://huggingface.co/org/model` URL directly; it is automatically converted to the bare repo ID.
+>
+> See [WINDOWS_ROCM.md](WINDOWS_ROCM.md) for full setup instructions.
 
 Heretic is a tool that removes censorship (aka "safety alignment") from
 transformer-based language models without expensive post-training.
@@ -44,7 +53,7 @@ The Heretic version, generated without any human effort, achieves the same
 level of refusal suppression as other abliterations, but at a much lower
 KL divergence, indicating less damage to the original model's capabilities.
 *(You can reproduce those numbers using Heretic's built-in evaluation functionality,
-e.g. `heretic --model google/gemma-3-12b-it --evaluate-model p-e-w/gemma-3-12b-it-heretic`.
+e.g. `heretic google/gemma-3-12b-it --evaluate-model p-e-w/gemma-3-12b-it-heretic`.
 Note that the exact values might be platform- and hardware-dependent.
 The table above was compiled using PyTorch 2.8 on an RTX 5090.)*
 
@@ -83,30 +92,53 @@ models with Heretic.
 
 ## Usage
 
-Prepare a Python 3.10+ environment with PyTorch 2.2+ installed as appropriate
-for your hardware. Then run:
+### GUI Launcher (Windows)
 
-```
-pip install -U heretic-llm
-heretic Qwen/Qwen3-4B-Instruct-2507
-```
+The easiest way to get started on Windows: clone the repository, then
+double-click **`Heretic-Launcher.bat`** in the repo root. It opens a graphical
+launcher that walks you through the entire setup and lets you start runs
+without touching the command line:
 
-Replace `Qwen/Qwen3-4B-Instruct-2507` with whatever model you want to decensor.
+- **One-click install** - installs the `uv` package manager if missing, runs
+  `uv sync`, and runs the ROCm GPU setup, each in its own console window.
+- **Setup status panel** - shows at a glance whether uv, the dependencies,
+  ROCm, and your GPU are ready.
+- **Run configuration** - paste a Hugging Face model ID or URL (or browse to
+  a local model), pick a config preset (default / nohumor / noslop), set
+  common options like quantization, trial count, and batch size, and hit
+  **Launch**. Heretic starts in a real console window with its full
+  interactive TUI; your settings are remembered for next time.
+- **Desktop shortcut** - one click creates a "Heretic" shortcut on your desktop.
 
-> [!IMPORTANT]
->
-> While PyTorch 2.2 is the minimum version of PyTorch needed for Heretic to work,
-> some models and configurations might require features only found in
-> later versions. For example, loading MXFP4-quantized models like gpt-oss
-> uses `torch.accelerator`, which was added in PyTorch 2.6.
+The launcher needs no dependencies of its own - it runs on any Python via
+`uv` or the system Python launcher.
 
-> [!TIP]
->
-> Heretic uses [uv](https://docs.astral.sh/uv/) for dependency management,
-> and the repository includes a `uv.lock` file pinning every package version.
-> If you already use uv (and you probably should!), you can just clone the repo
-> and run Heretic with `uv run heretic`, which ensures that your dependencies
-> match those used by the developers, improving reliability and security.
+### Quick Start (Windows AMD GPU, command line)
+
+1. Clone and enter the repository:
+   ```powershell
+   git clone https://github.com/Matlan1/heretic-win-AMD.git
+   cd heretic-win-AMD
+   ```
+
+2. Install base dependencies:
+   ```powershell
+   uv sync
+   ```
+
+3. Run heretic - on first launch it detects your AMD GPU and prompts to run ROCm setup:
+   ```powershell
+   uv run heretic Qwen/Qwen3-4B-Instruct-2507
+   ```
+   Press **Y** when prompted. A setup window opens, installs the ROCm wheels for your GPU generation, and relaunches heretic automatically when done.
+
+   > **Prefer manual setup?** Run `uv run python scripts/setup_rocm.py` instead, then start heretic normally.
+
+Setup only runs once. Every subsequent `uv run heretic` starts immediately.
+
+For prerequisites, troubleshooting, and bitsandbytes source builds, see **[WINDOWS_ROCM.md](WINDOWS_ROCM.md)**.
+
+---
 
 The process is fully automatic and does not require configuration; however,
 Heretic has a variety of configuration parameters that can be changed for
@@ -122,20 +154,58 @@ takes about 20-30 minutes. Note that Heretic supports model quantization with
 bitsandbytes, which can drastically reduce the amount of VRAM required to process
 models. Set the `quantization` option to `bnb_4bit` to enable quantization.
 
+For a model too large to fit in GPU plus CPU memory, set `offload_folder`
+(default: an `offload` folder in the working directory) so Accelerate can spill
+weights to disk instead of failing to load. Disk offload lets very large models
+run, but is slow - prefer a model that fits in memory, or a smaller quantization,
+when you can.
+
 After Heretic has finished decensoring a model, you are given the option to
 save the model, upload it to Hugging Face, chat with it to test how well it works,
 run standard benchmarks on it, or any combination of those actions.
+
+### Reasoning ("thinking") models
+
+Heretic measures refusals and KL divergence on a model's actual *answer*, not on
+its internal reasoning. For reasoning models such as Qwen3, DeepSeek-R1, and
+gpt-oss - including those whose chat template injects the `<think>` opener into
+the prompt - Heretic automatically detects the Chain-of-Thought block and skips
+past it before evaluating. No configuration is required; the detected markers can
+be customized through the `chain_of_thought_skips` option.
+
+### GGUF models
+
+Heretic can decensor models distributed in GGUF format. The GGUF is dequantized
+on load, abliterated, and saved as standard safetensors. (If you installed
+Heretic before GGUF support was added, run `uv sync` once to pull in the `gguf`
+package.)
+
+```powershell
+# A local .gguf path (like any model, it can be passed positionally):
+uv run heretic D:\models\qwen\model-Q8_0.gguf
+
+# A GGUF file inside a Hugging Face repository. As with any extra flags, give
+# the model with --model so it isn't mistaken for a flag value:
+uv run heretic --model bartowski/Qwen2.5-0.5B-Instruct-GGUF --gguf-file Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+```
+
+To additionally write a `.gguf` of the abliterated model, set `--export-gguf`.
+This is a best-effort post-processing step that shells out to llama.cpp's
+`convert_hf_to_gguf.py`; point Heretic at your llama.cpp checkout with
+`--llama-cpp-path` (or put the script on your `PATH`), and choose the output
+type with `--gguf-export-type` (e.g. `q8_0`, `q4_k_m`, `f16`). If llama.cpp is
+not available, the safetensors model is still saved and a hint is printed.
 
 
 ## Research features
 
 In addition to its primary function of removing model censorship, Heretic also
 provides features designed to support research into the semantics of model internals
-(interpretability). To use those features, you need to install Heretic with the
-optional `research` extra:
+(interpretability). These need the optional `research` extra. Since this fork is
+run from a clone with `uv` (not installed from PyPI), enable it with:
 
-```
-pip install -U heretic-llm[research]
+```powershell
+uv sync --extra research
 ```
 
 This gives you access to the following functionality:
@@ -287,7 +357,7 @@ If you use Heretic for your research, please cite it using the following BibTeX 
   year = {2025},
   publisher = {GitHub},
   journal = {GitHub repository},
-  howpublished = {\url{https://github.com/p-e-w/heretic}}
+  howpublished = {\url{https://github.com/Matlan1/heretic-win-AMD}}
 }
 ```
 

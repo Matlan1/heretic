@@ -3,6 +3,7 @@
 
 # ruff: noqa: E402
 
+import os
 import sys
 
 # Ensure standard output/error use UTF-8 instead of system default charmap (e.g. cp1252 on Windows).
@@ -12,6 +13,418 @@ for stream in (sys.stdout, sys.stderr):
         and (getattr(stream, "encoding", "") or "").lower() != "utf-8"
     ):
         stream.reconfigure(encoding="utf-8")  # type: ignore
+if sys.platform == "win32":
+    # Reconfigure stdout/stderr to UTF-8 for Windows terminals that default to cp1252.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+    except Exception:
+        pass
+
+if "-h" not in sys.argv and "--help" not in sys.argv:
+    try:
+        from importlib.metadata import version
+
+        sys.stdout.write(
+            f"\033[36m█░█░█▀▀░█▀▄░█▀▀░▀█▀░█░█▀▀\033[0m  v{version('heretic-llm')}\n"
+        )
+        sys.stdout.write("\033[36m█▀█░█▀▀░█▀▄░█▀▀░░█░░█░█░░\033[0m\n")
+        sys.stdout.write(
+            "\033[36m▀░▀░▀▀▀░▀░▀░▀▀▀░░▀░░▀░▀▀▀\033[0m  \033[4;34mhttps://github.com/p-e-w/heretic\033[0m\n\n"
+        )
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+    # -------------------------------------------------------------------------
+    # Windows AMD ROCm Setup Check
+    # Checks whether ROCm has been configured for the detected GPU architecture.
+    # If not, tells the user to run setup_rocm.py and exits cleanly.
+    #
+    # ROCm setup (wheel install + bitsandbytes patch) lives in scripts/setup_rocm.py
+    # which runs BEFORE heretic.exe is launched - avoiding the Windows file-lock
+    # that occurs when uv sync tries to update heretic.exe while it's running.
+    # -------------------------------------------------------------------------
+    if sys.platform == "win32":
+        import subprocess
+
+        # ------------------------------------------------------------------
+        # 1. Detect whether an AMD GPU is present.
+        # ------------------------------------------------------------------
+        has_amd = False
+        generation_name = "AMD GPU"
+        try:
+            gpu_out = subprocess.check_output(
+                ["wmic", "path", "win32_VideoController", "get", "name"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            has_amd = any(b in gpu_out for b in ("AMD", "Radeon"))
+        except Exception:
+            try:
+                gpu_out = subprocess.check_output(
+                    [
+                        "powershell",
+                        "-Command",
+                        "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+                    ],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+                has_amd = any(b in gpu_out for b in ("AMD", "Radeon"))
+            except Exception:
+                pass
+
+        # ------------------------------------------------------------------
+        # 2. Detect whether ROCm torch is installed.
+        # ------------------------------------------------------------------
+        is_cpu = True
+        try:
+            from importlib.metadata import version as _pkg_version
+
+            _torch_ver = _pkg_version("torch")
+            if "+rocm" in _torch_ver or "+cu" in _torch_ver:
+                is_cpu = False
+        except Exception:
+            pass
+
+        # ------------------------------------------------------------------
+        # 3. Check for marker file to skip setup if already configured.
+        # ------------------------------------------------------------------
+        _repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        if not os.path.isfile(os.path.join(_repo_root, "pyproject.toml")):
+            _repo_root = os.getcwd()
+        _marker_path = os.path.join(_repo_root, ".heretic_rocm_arch")
+        _already_configured = os.path.isfile(_marker_path)
+
+        # ------------------------------------------------------------------
+        # 4. If setup is needed: prompt and exit.
+        # ------------------------------------------------------------------
+        if has_amd and not _already_configured and is_cpu:
+            sys.stdout.write("AMD GPU detected - ROCm isn't configured yet.\n\n")
+            sys.stdout.write("  [Y] Run first-time setup now\n")
+            sys.stdout.write("  [N] I'll handle it myself\n\n")
+            sys.stdout.write("Choice [Y/n]: ")
+            sys.stdout.flush()
+            try:
+                answer = input().strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = "n"
+            if answer in ("", "y", "yes"):
+                _setup_script = os.path.join(_repo_root, "scripts", "setup_rocm.py")
+                if not os.path.exists(_setup_script):
+                    _setup_script = os.path.join(
+                        os.getcwd(), "scripts", "setup_rocm.py"
+                    )
+                import ctypes as _ctypes
+                import shutil as _shutil
+                import tempfile
+
+                _uv = _shutil.which("uv") or "uv"
+
+                # Capture the original console HWND before spawning the setup
+                # window. After setup finishes, the PS1 script uses
+                # SetForegroundWindow + SendKeys to focus this terminal and type
+                # the relaunch command into it - so heretic restarts here.
+                _orig_hwnd = _ctypes.windll.kernel32.GetConsoleWindow()
+
+                def _sk_escape(s):
+                    return "".join("{" + c + "}" if c in "+^%~(){}" else c for c in s)
+
+                def _ps_sq(s):
+                    return s.replace("'", "''")
+
+                _relaunch_cmd = "uv run heretic " + " ".join(
+                    f'"{a}"' if any(c in a for c in (" ", "&", "(", ")")) else a
+                    for a in sys.argv[1:]
+                )
+
+                _ps1_fd, _ps1_path = tempfile.mkstemp(
+                    suffix=".ps1", prefix="heretic_setup_"
+                )
+                os.close(_ps1_fd)
+                with open(_ps1_path, "w", encoding="utf-8") as _f:
+                    _f.write(f"Set-Location '{_ps_sq(_repo_root)}'\n")
+                    _f.write("Start-Sleep -Seconds 1\n")
+                    _f.write(
+                        f"& '{_ps_sq(_uv)}' run python '{_ps_sq(_setup_script)}'\n"
+                    )
+                    _f.write("if ($LASTEXITCODE -ne 0) {\n")
+                    _f.write("    Write-Host ''\n")
+                    _f.write(
+                        "    Write-Host 'Setup failed. Please run setup manually.'\n"
+                    )
+                    _f.write("    Read-Host 'Press Enter to close'\n")
+                    _f.write(
+                        f"    Remove-Item '{_ps_sq(_ps1_path)}' -ErrorAction SilentlyContinue\n"
+                    )
+                    _f.write("    exit 1\n")
+                    _f.write("}\n")
+                    _f.write("Write-Host ''\n")
+                    _f.write(
+                        "Write-Host 'Setup complete - relaunching heretic in your terminal...'\n"
+                    )
+                    _f.write("Write-Host ''\n")
+                    _f.write("Add-Type @'\n")
+                    _f.write("using System;\n")
+                    _f.write("using System.Runtime.InteropServices;\n")
+                    _f.write("public class HereticW32 {\n")
+                    _f.write(
+                        '    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);\n'
+                    )
+                    _f.write(
+                        '    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);\n'
+                    )
+                    _f.write("}\n")
+                    _f.write("'@\n")
+                    _f.write(f"$hwnd = [IntPtr]{_orig_hwnd}\n")
+                    _f.write("[HereticW32]::ShowWindow($hwnd, 9) | Out-Null\n")
+                    _f.write("Start-Sleep -Milliseconds 300\n")
+                    _f.write("[HereticW32]::SetForegroundWindow($hwnd) | Out-Null\n")
+                    _f.write("Start-Sleep -Milliseconds 500\n")
+                    _f.write("Add-Type -AssemblyName System.Windows.Forms\n")
+                    _f.write(
+                        f"[System.Windows.Forms.SendKeys]::SendWait('{_sk_escape(_relaunch_cmd)}')\n"
+                    )
+                    _f.write("[System.Windows.Forms.SendKeys]::SendWait('{ENTER}')\n")
+                    _f.write("Start-Sleep -Milliseconds 200\n")
+                    _f.write(
+                        f"Remove-Item '{_ps_sq(_ps1_path)}' -ErrorAction SilentlyContinue\n"
+                    )
+
+                sys.stdout.write(
+                    "\nSetup is opening in a new window - heretic will relaunch here when done.\n\n"
+                )
+                sys.stdout.flush()
+                subprocess.Popen(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        _ps1_path,
+                    ],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
+            sys.exit(0)
+
+        # ------------------------------------------------------------------
+        # 5. If ROCm torch is active, run the bitsandbytes pre-patch.
+        # ------------------------------------------------------------------
+        if not is_cpu:
+            import importlib.util as _ilu
+
+            try:
+                _spec = _ilu.find_spec("bitsandbytes")
+                if _spec is not None and _spec.submodule_search_locations:
+                    _bnb_dir = _spec.submodule_search_locations[0]
+                    _dll_dest = os.path.join(_bnb_dir, "libbitsandbytes_rocm83.dll")
+                    if not os.path.exists(_dll_dest):
+                        _script_path = os.path.join(
+                            _repo_root, "scripts", "patch_bitsandbytes.py"
+                        )
+                        if not os.path.exists(_script_path):
+                            _script_path = os.path.join(
+                                os.getcwd(), "scripts", "patch_bitsandbytes.py"
+                            )
+                        if os.path.exists(_script_path):
+                            subprocess.check_call([sys.executable, _script_path])
+            except Exception:
+                pass  # Non-fatal.
+
+            # ------------------------------------------------------------------
+            # 6. Windows ROCm: replace safetensors safe_open with a
+            #    pure-Python reader to avoid 0xC0000005 crash.
+            # ------------------------------------------------------------------
+            # The Rust backend (_safetensors_rust.pyd) crashes with access
+            # violation 0xC0000005 on Windows ROCm when any tensor is read
+            # via the PySafeSlice path *or* via get_tensor() when the Rust
+            # code tries to create a PyTorch tensor through the Rust→C++ bridge.
+            #
+            # Root cause: the Rust code calls back into Python's
+            # legacy_tensor_ctor which invokes _local_scalar_dense_cpu and
+            # crashes.  The only safe fix is to never call _safetensors_rust
+            # at all and instead read the binary file format directly in
+            # Python, constructing tensors with torch.frombuffer() which does
+            # not go through the Rust bridge.
+            #
+            # This patch installs _PurePySafeOpen as safetensors.safe_open
+            # before transformers/accelerate are imported.  Both libraries do
+            # `from safetensors import safe_open` at their import time, so
+            # they pick up the pure-Python version automatically.
+            try:
+                import json as _st_json
+                import struct as _st_struct
+
+                import safetensors as _st_mod
+
+                class _SafeSliceShim:
+                    """CPU tensor wrapper that looks like PySafeSlice - no Rust."""
+
+                    __slots__ = ("_t",)
+
+                    def __init__(self, tensor):
+                        self._t = tensor
+
+                    def __getitem__(self, slices):
+                        return self._t[slices]
+
+                    def get_shape(self):
+                        return list(self._t.shape)
+
+                    @property
+                    def dtype(self):
+                        _TO_ST = {
+                            "torch.float32": "F32",
+                            "torch.float16": "F16",
+                            "torch.bfloat16": "BF16",
+                            "torch.float64": "F64",
+                            "torch.int64": "I64",
+                            "torch.int32": "I32",
+                            "torch.int16": "I16",
+                            "torch.int8": "I8",
+                            "torch.uint8": "U8",
+                            "torch.bool": "BOOL",
+                        }
+                        return _TO_ST.get(str(self._t.dtype), "F32")
+
+                class _PurePySafeOpen:
+                    """
+                    Pure-Python safetensors reader - zero calls to
+                    _safetensors_rust.pyd.
+
+                    Reads the safetensors binary format with struct+json,
+                    builds tensors with torch.frombuffer().  Supports the
+                    full API expected by accelerate and
+                    safetensors.torch.load_file:
+
+                        context manager (__enter__ / __exit__)
+                        keys() / offset_keys() / metadata()
+                        get_tensor() / get_slice()
+                    """
+
+                    # safetensors dtype tag → torch dtype name
+                    _DTYPES = {
+                        "F32": "float32",
+                        "F16": "float16",
+                        "BF16": None,  # special: read as int16, view as bfloat16
+                        "F64": "float64",
+                        "I64": "int64",
+                        "I32": "int32",
+                        "I16": "int16",
+                        "I8": "int8",
+                        "U8": "uint8",
+                        "BOOL": "bool",
+                    }
+
+                    def __init__(self, filename, framework, device="cpu"):
+                        self._filename = str(filename)
+                        self._device = str(device) if device else "cpu"
+                        self._file = open(self._filename, "rb")
+                        try:
+                            header_len = _st_struct.unpack("<Q", self._file.read(8))[0]
+                            full_hdr = _st_json.loads(self._file.read(header_len))
+                        except Exception:
+                            self._file.close()
+                            raise
+                        self._metadata = full_hdr.pop("__metadata__", {})
+                        self._header = full_hdr  # {name: {dtype, shape, data_offsets}}
+                        self._data_off = (
+                            8 + header_len
+                        )  # byte offset of tensor data region
+
+                    # ---- context manager ----------------------------------------
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        self._close()
+
+                    def __del__(self):
+                        self._close()
+
+                    def _close(self):
+                        try:
+                            if not self._file.closed:
+                                self._file.close()
+                        except Exception:
+                            pass
+
+                    # ---- public API ---------------------------------------------
+                    def keys(self):
+                        return list(self._header.keys())
+
+                    def offset_keys(self):
+                        """safetensors.torch.load_file calls offset_keys(), not keys()."""
+                        return self.keys()
+
+                    def metadata(self):
+                        return self._metadata
+
+                    def get_tensor(self, name):
+                        t = self._load_cpu(name)
+                        if self._device != "cpu":
+                            t = t.to(self._device)
+                        return t
+
+                    def get_slice(self, name):
+                        return _SafeSliceShim(self._load_cpu(name))
+
+                    # ---- internal -----------------------------------------------
+                    def _load_cpu(self, name):
+                        """Read one tensor from disk into a CPU torch.Tensor."""
+                        import torch
+
+                        info = self._header[name]
+                        dtype_str = info["dtype"]
+                        shape = info["shape"]
+                        start, end = info["data_offsets"]
+                        n_bytes = end - start
+
+                        # Empty tensor (zero-size dimension)
+                        if n_bytes == 0:
+                            tname = self._DTYPES.get(dtype_str) or "bfloat16"
+                            return torch.empty(shape, dtype=getattr(torch, tname))
+
+                        self._file.seek(self._data_off + start)
+                        raw = bytearray(
+                            self._file.read(n_bytes)
+                        )  # mutable → frombuffer works
+
+                        if dtype_str == "BF16":
+                            # bfloat16 isn't a native numpy dtype; read bytes as
+                            # int16 (same width), then reinterpret bits as bfloat16.
+                            t = torch.frombuffer(raw, dtype=torch.int16).view(
+                                torch.bfloat16
+                            )
+                        else:
+                            tname = self._DTYPES.get(dtype_str)
+                            if tname is None:
+                                raise ValueError(
+                                    f"Unsupported safetensors dtype: {dtype_str!r}"
+                                )
+                            t = torch.frombuffer(raw, dtype=getattr(torch, tname))
+
+                        if shape:
+                            t = t.reshape(shape)
+                        # Clone so the tensor owns its memory;
+                        # raw (and the file seek) can then be reused freely.
+                        return t.clone()
+
+                # Install the pure-Python reader as safetensors.safe_open.
+                # Submodules (safetensors.torch, etc.) are imported later as
+                # part of transformers; they do `from safetensors import safe_open`
+                # at their module level, so they automatically get _PurePySafeOpen.
+                _st_mod.safe_open = _PurePySafeOpen
+
+            except Exception:
+                pass  # Non-fatal; safetensors may not be installed yet.
+
 
 from .config import Settings
 
@@ -36,9 +449,18 @@ patch_tqdm()
 """
 
 import logging
+
+if sys.platform == "win32":
+    # bitsandbytes calls `rocminfo` (a Linux-only tool) at import time to
+    # detect GPU architecture on ROCm. On Windows this raises FileNotFoundError
+    # and logs noisy ERROR messages that are harmless when quantization is
+    # disabled.
+    logging.getLogger("bitsandbytes").setLevel(logging.CRITICAL)
 import math
 import os
 import random
+import shutil
+import subprocess
 import time
 import warnings
 from dataclasses import asdict
@@ -48,22 +470,17 @@ from pathlib import Path
 from typing import Any
 
 import huggingface_hub
-import lm_eval
 import numpy as np
-import optuna
 import questionary
 import torch
 import torch.nn.functional as F
 import transformers
 from huggingface_hub import HfApi, ModelCard, ModelCardData
-from lm_eval.models.huggingface import HFLM
-from optuna import Trial, TrialPruned
-from optuna.exceptions import ExperimentalWarning
-from optuna.samplers import TPESampler
-from optuna.storages import JournalStorage
-from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
-from optuna.study import StudyDirection
-from optuna.trial import TrialState, create_trial
+
+# NOTE (Windows ROCm fork): optuna and lm_eval are imported lazily inside run()
+# (see below), not at module level, to keep them off the startup/--help path.
+# Upstream imports them here at the top; we keep the fork's lazy pattern and only
+# ensure HfApi (lightweight, huggingface_hub is already imported above) is available.
 from pydantic import ValidationError
 from questionary import Choice, Style
 from rich.table import Table
@@ -98,6 +515,135 @@ from .utils import (
 )
 
 
+def detect_template_cot_prefix(settings: Settings, model: Model) -> str | None:
+    """
+    Returns the Chain-of-Thought closing marker if the chat template injects an
+    opener into the prompt, or None if it does not.
+
+    Reasoning models such as Qwen3 and DeepSeek-R1 append an opener like "<think>"
+    to the generation prompt via their chat template. In that case the response
+    begins inside the reasoning block, so the common-prefix heuristic never sees
+    the opener. We instead render a sample prompt and, if it ends with a known
+    Chain-of-Thought initializer, return only the closing part of the matching
+    closed block (e.g. "</think>" for the pair ("<think>", "<think></think>")),
+    which is appended as the response prefix to skip straight to the answer.
+    """
+    try:
+        rendered = model.tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": settings.system_prompt},
+                {"role": "user", "content": "Hello"},
+            ],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+    except Exception:
+        # Some templates reject a system role or otherwise fail to render; in that
+        # case we simply fall back to the response-based detection below.
+        return None
+
+    rendered = str(rendered).rstrip()
+
+    for cot_initializer, closed_cot_block in settings.chain_of_thought_skips:
+        if rendered.endswith(cot_initializer) and closed_cot_block.startswith(
+            cot_initializer
+        ):
+            return closed_cot_block[len(cot_initializer) :]
+
+    return None
+
+
+def find_gguf_converter(llama_cpp_path: str | None) -> Path | None:
+    """
+    Locates llama.cpp's convert_hf_to_gguf.py script.
+
+    Searches, in order: an explicit llama_cpp_path (file or directory), the
+    system PATH, and a few common checkout locations. Returns the script path,
+    or None if it cannot be found.
+    """
+    candidates: list[Path] = []
+
+    if llama_cpp_path:
+        path = Path(llama_cpp_path)
+        if path.is_file():
+            return path
+        candidates.append(path / "convert_hf_to_gguf.py")
+
+    on_path = shutil.which("convert_hf_to_gguf.py")
+    if on_path:
+        candidates.append(Path(on_path))
+
+    candidates.extend(
+        [
+            Path.home() / "llama.cpp" / "convert_hf_to_gguf.py",
+            Path.cwd() / "llama.cpp" / "convert_hf_to_gguf.py",
+        ]
+    )
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    return None
+
+
+def export_to_gguf(save_directory: str, settings: Settings) -> None:
+    """
+    Converts a saved (merged) model to GGUF using llama.cpp, if requested.
+
+    This is a best-effort post-processing step: if the conversion script cannot
+    be found or the conversion fails, a clear message is printed and the run
+    continues, since the safetensors model has already been saved.
+    """
+    converter = find_gguf_converter(settings.llama_cpp_path)
+    if converter is None:
+        print(
+            "[yellow]GGUF export requested, but convert_hf_to_gguf.py was not found.[/]"
+        )
+        print(
+            "[yellow]Clone llama.cpp (https://github.com/ggml-org/llama.cpp), install its[/]"
+        )
+        print(
+            "[yellow]requirements, and set 'llama_cpp_path' (or put the script on PATH).[/]"
+        )
+        print("[yellow]The safetensors model has already been saved.[/]")
+        return
+
+    output_path = (
+        Path(save_directory)
+        / f"{Path(save_directory).name}.{settings.gguf_export_type}.gguf"
+    )
+
+    command = [
+        sys.executable,
+        str(converter),
+        save_directory,
+        "--outfile",
+        str(output_path),
+        "--outtype",
+        settings.gguf_export_type,
+    ]
+
+    print(f"Converting to GGUF ([bold]{settings.gguf_export_type}[/])...")
+    print(f"* Running: [bold]{' '.join(command)}[/]")
+    try:
+        result = subprocess.run(command, check=False)
+    except OSError as error:
+        print(f"[red]GGUF conversion could not be started:[/] {error}")
+        print("[yellow]The safetensors model has already been saved.[/]")
+        return
+
+    if result.returncode == 0:
+        print(f"GGUF model saved to [bold]{output_path}[/].")
+    else:
+        print(
+            "[red]GGUF conversion failed.[/] The llama.cpp script may need its Python "
+            "requirements installed (pip install -r requirements.txt in the llama.cpp repo), "
+            "or this architecture may not be supported by your llama.cpp version."
+        )
+        print("[yellow]The safetensors model has already been saved.[/]")
+
+
 def obtain_export_strategy(
     settings: Settings,
     model: Model,
@@ -121,31 +667,10 @@ def obtain_export_strategy(
         )
         print("[yellow]This can lead to system freezes if you run out of memory.[/]")
 
-        try:
-            # Estimate memory requirements by loading the model structure on the "meta" device.
-            # This doesn't consume actual RAM but allows us to inspect the parameter count/dtype.
-            #
-            # Suppress warnings during meta device loading (e.g., "Some weights were not initialized").
-            # These are expected and harmless since we're only inspecting model structure, not running inference.
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                meta_model = get_model_class(settings.model).from_pretrained(
-                    settings.model,
-                    device_map="meta",
-                    torch_dtype=torch.bfloat16,
-                    trust_remote_code=True
-                    if settings.model in model.trusted_models
-                    else None,
-                    **model.revision_kwargs,
-                )
-                footprint_bytes = meta_model.get_memory_footprint()
-                footprint_gb = footprint_bytes / (1024**3)
-                print(
-                    f"[yellow]Estimated RAM required (excluding overhead): [bold]~{footprint_gb:.2f} GB[/][/]"
-                )
-        except Exception:
-            # Fallback if meta loading fails (e.g. owing to custom model code
-            # or bitsandbytes quantization config issues on the meta device).
+        if model.gguf_kwargs:
+            # GGUF models are dequantized during loading and cannot be re-loaded on
+            # the "meta" device for estimation, so fall back to a rule of thumb.
+            print("[yellow]GGUF model: meta-device estimation is unavailable.[/]")
             print(
                 "[yellow]Rule of thumb: You need approximately 3x the parameter count in GB RAM.[/]"
             )
@@ -153,6 +678,38 @@ def obtain_export_strategy(
                 "[yellow]Example: A 27B model requires ~80GB RAM. A 70B model requires ~200GB RAM.[/]"
             )
 
+        else:
+            try:
+                # Estimate memory requirements by loading the model structure on the "meta" device.
+                # This doesn't consume actual RAM but allows us to inspect the parameter count/dtype.
+                #
+                # Suppress warnings during meta device loading (e.g., "Some weights were not initialized").
+                # These are expected and harmless since we're only inspecting model structure, not running inference.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    meta_model = get_model_class(settings.model).from_pretrained(
+                        settings.model,
+                        device_map="meta",
+                        torch_dtype=torch.bfloat16,
+                        trust_remote_code=True
+                        if settings.model in model.trusted_models
+                        else None,
+                        **model.revision_kwargs,
+                    )
+                    footprint_bytes = meta_model.get_memory_footprint()
+                    footprint_gb = footprint_bytes / (1024**3)
+                    print(
+                        f"[yellow]Estimated RAM required (excluding overhead): [bold]~{footprint_gb:.2f} GB[/][/]"
+                    )
+            except Exception:
+                # Fallback if meta loading fails (e.g. owing to custom model code
+                # or bitsandbytes quantization config issues on the meta device).
+                print(
+                    "[yellow]Rule of thumb: You need approximately 3x the parameter count in GB RAM.[/]"
+                )
+                print(
+                    "[yellow]Example: A 27B model requires ~80GB RAM. A 70B model requires ~200GB RAM.[/]"
+                )
         print()
 
     strategy = prompt_select(
@@ -285,6 +842,15 @@ def run():
 
     # Another library that generates warning spam.
     logging.getLogger("lm_eval").setLevel(logging.ERROR)
+
+    import optuna
+    from optuna import Trial, TrialPruned
+    from optuna.exceptions import ExperimentalWarning
+    from optuna.samplers import TPESampler
+    from optuna.storages import JournalStorage
+    from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
+    from optuna.study import StudyDirection
+    from optuna.trial import TrialState, create_trial
 
     # We do our own trial logging, so we don't need the INFO messages
     # about parameters and results.
@@ -449,40 +1015,57 @@ def run():
         print()
         print("Checking for common response prefix...")
         prefix_check_prompts = good_prompts[:100] + bad_prompts[:100]
-        responses = model.get_responses_batched(prefix_check_prompts)
 
-        # Despite being located in os.path, commonprefix actually performs
-        # a naive string operation without any path-specific logic,
-        # which is exactly what we need here. Trailing spaces are removed
-        # to avoid issues where multiple different tokens that all start
-        # with a space character lead to the common prefix ending with
-        # a space, which would result in an uncommon tokenization.
-        settings.response_prefix = commonprefix(responses).rstrip(" ")
+        def recheck_prefix() -> None:
+            # When using a Chain-of-Thought skip, we need to check that the prefix
+            # is actually complete (e.g. not missing a trailing newline).
+            print("* Rechecking with prefix...")
+            responses = model.get_responses_batched(prefix_check_prompts)
+            additional_prefix = commonprefix(responses).rstrip(" ")
+            if additional_prefix:
+                assert settings.response_prefix is not None
+                settings.response_prefix += additional_prefix
+                print(f"* Extended prefix found: [bold]{settings.response_prefix!r}[/]")
 
-        if settings.response_prefix:
-            print(f"* Prefix found: [bold]{settings.response_prefix!r}[/]")
+        # Reasoning models whose chat template injects the Chain-of-Thought opener
+        # (e.g. "<think>") into the prompt produce responses that start inside the
+        # reasoning block, so the opener never appears in the response prefix.
+        # Detect this from the rendered template and skip to the closing marker.
+        template_cot_prefix = detect_template_cot_prefix(settings, model)
 
-            for cot_initializer, closed_cot_block in settings.chain_of_thought_skips:
-                if settings.response_prefix.startswith(cot_initializer):
-                    settings.response_prefix = closed_cot_block
-                    print(
-                        f"* Closed Chain-of-Thought block: [bold]{settings.response_prefix!r}[/]"
-                    )
-
-                    # When using a Chain-of-Thought skip, we need to check that the prefix
-                    # is actually complete (e.g. not missing a trailing newline).
-                    print("* Rechecking with prefix...")
-                    responses = model.get_responses_batched(prefix_check_prompts)
-                    additional_prefix = commonprefix(responses).rstrip(" ")
-                    if additional_prefix:
-                        settings.response_prefix += additional_prefix
-                        print(
-                            f"* Extended prefix found: [bold]{settings.response_prefix!r}[/]"
-                        )
-
-                    break
+        if template_cot_prefix is not None:
+            settings.response_prefix = template_cot_prefix
+            print(
+                f"* Closed Chain-of-Thought block: [bold]{settings.response_prefix!r}[/]"
+            )
+            recheck_prefix()
         else:
-            print("* None found")
+            responses = model.get_responses_batched(prefix_check_prompts)
+
+            # Despite being located in os.path, commonprefix actually performs
+            # a naive string operation without any path-specific logic,
+            # which is exactly what we need here. Trailing spaces are removed
+            # to avoid issues where multiple different tokens that all start
+            # with a space character lead to the common prefix ending with
+            # a space, which would result in an uncommon tokenization.
+            settings.response_prefix = commonprefix(responses).rstrip(" ")
+
+            if settings.response_prefix:
+                print(f"* Prefix found: [bold]{settings.response_prefix!r}[/]")
+
+                for (
+                    cot_initializer,
+                    closed_cot_block,
+                ) in settings.chain_of_thought_skips:
+                    if settings.response_prefix.startswith(cot_initializer):
+                        settings.response_prefix = closed_cot_block
+                        print(
+                            f"* Closed Chain-of-Thought block: [bold]{settings.response_prefix!r}[/]"
+                        )
+                        recheck_prefix()
+                        break
+            else:
+                print("* None found")
 
     evaluator = Evaluator(settings, model)
 
@@ -926,6 +1509,14 @@ def run():
 
                             print(f"Model saved to [bold]{save_directory}[/].")
 
+                            # Optional GGUF conversion. Only meaningful for a merged
+                            # model: a bare LoRA adapter has no weights to convert.
+                            if (
+                                settings.export_gguf
+                                and strategy != ExportStrategy.ADAPTER
+                            ):
+                                export_to_gguf(save_directory, settings)
+
                             if reproduction_mode and verify_hashes:
                                 print("Verifying hashes of weight files...")
 
@@ -1232,6 +1823,8 @@ def run():
                             if scope is None:
                                 continue
                             benchmark_original_model = scope == "Benchmark both models"
+                            import lm_eval
+                            from lm_eval.models.huggingface import HFLM
 
                             hflm = HFLM(
                                 pretrained=model.model,  # ty:ignore[invalid-argument-type]

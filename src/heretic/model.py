@@ -1,12 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import importlib.util
 import math
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Type, cast
 
-import bitsandbytes as bnb
+try:
+    import bitsandbytes as bnb
+except (ImportError, RuntimeError):
+    # bitsandbytes is optional: it is only required when --quantization bnb_4bit
+    # is used. On platforms where the native ROCm or CUDA library is absent
+    # (e.g. Windows ROCm), the import raises RuntimeError. heretic will still
+    # work with --quantization none.
+    bnb = None  # type: ignore[assignment]
 import torch
 import torch.linalg as LA
 import torch.nn.functional as F
@@ -38,7 +47,13 @@ from .utils import Prompt, batchify, format_exception, print
 
 def get_model_class(
     model: str,
+    gguf_file: str | None = None,
 ) -> Type[AutoModelForImageTextToText] | Type[AutoModelForCausalLM]:
+    # GGUF models are text-only causal LMs, and a bare GGUF has no config.json
+    # for the vision probe below to read, so resolve it directly.
+    if gguf_file is not None:
+        return AutoModelForCausalLM
+
     configs = PretrainedConfig.get_config_dict(model)
 
     if any([("vision_config" in config) for config in configs]):
@@ -71,19 +86,61 @@ class Model:
         if settings.model_commit is not None:
             self.revision_kwargs["revision"] = settings.model_commit
 
+        # Resolve a GGUF input, if any. Transformers loads GGUF models by
+        # dequantizing them on the fly, given the containing repo/directory plus
+        # the GGUF file name. The file can be specified explicitly via
+        # settings.gguf_file, or detected when the model path itself ends in
+        # ".gguf" (in which case the parent directory is used as the load path).
+        self.model_path = settings.model
+        gguf_name = settings.gguf_file
+        if gguf_name is None and settings.model.lower().endswith(".gguf"):
+            gguf_path = Path(settings.model)
+            gguf_name = gguf_path.name
+            self.model_path = str(gguf_path.parent) if gguf_path.parent.name else "."
+        self.gguf_kwargs: dict[str, str] = {"gguf_file": gguf_name} if gguf_name else {}
+
+        # Folder used by Accelerate to offload weights to disk when a model does
+        # not fit in GPU + CPU memory. Providing it lets large models load
+        # (slowly) instead of failing with "provide an offload_folder".
+        self.offload_folder = settings.offload_folder or str(Path.cwd() / "offload")
+        Path(self.offload_folder).mkdir(parents=True, exist_ok=True)
+
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
+        if gguf_name:
+            print(
+                f"* Loading from GGUF file [bold]{gguf_name}[/] (dequantized on load)"
+            )
+            # Transformers parses GGUF files through the separate 'gguf' package.
+            # Check for it up front to give a clear, actionable error instead of
+            # the confusing "install torch and gguf" message raised deep inside
+            # Transformers (torch is already installed at this point).
+            if importlib.util.find_spec("gguf") is None:
+                raise ImportError(
+                    "Loading GGUF models requires the 'gguf' package, which is not "
+                    "installed.\n\nInstall it with:\n\n"
+                    '    uv pip install "gguf>=0.10.0"\n\n'
+                    "then run Heretic again."
+                )
+            if settings.quantization == QuantizationMethod.BNB_4BIT:
+                print(
+                    "* [yellow]Ignoring 4-bit quantization:[/] Transformers does not "
+                    "allow quantizing a model loaded from GGUF, so it is loaded "
+                    "dequantized. Large GGUF models may need disk offload (slow) or a "
+                    "smaller model that fits in memory."
+                )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            settings.model,
+            self.model_path,
             **self.revision_kwargs,
+            **self.gguf_kwargs,
         )
 
         # Multimodal models have a processor we'll want to save.
         self.processor = None
-        if get_model_class(settings.model) == AutoModelForImageTextToText:
+        if get_model_class(self.model_path, gguf_name) == AutoModelForImageTextToText:
             self.processor = AutoProcessor.from_pretrained(
-                settings.model,
+                self.model_path,
                 **self.revision_kwargs,
             )
 
@@ -117,15 +174,19 @@ class Model:
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
 
-                self.model = get_model_class(settings.model).from_pretrained(
-                    settings.model,
+                self.model = get_model_class(
+                    self.model_path, self.gguf_kwargs.get("gguf_file")
+                ).from_pretrained(
+                    self.model_path,
                     dtype=dtype,
                     device_map=settings.device_map,
                     max_memory=self.max_memory,
+                    offload_folder=self.offload_folder,
                     trust_remote_code=True
                     if settings.model in self.trusted_models
                     else None,
                     **self.revision_kwargs,
+                    **self.gguf_kwargs,
                     **extra_kwargs,
                 )
 
@@ -248,7 +309,19 @@ class Model:
         Returns:
             BitsAndBytesConfig or None
         """
+        # Transformers does not allow combining a GGUF source with a quantization
+        # config ("You cannot combine Quantization and loading a model from a GGUF
+        # file"), so skip quantization for GGUF inputs and load them dequantized.
+        if self.gguf_kwargs:
+            return None
+
         if self.settings.quantization == QuantizationMethod.BNB_4BIT:
+            if bnb is None:
+                raise RuntimeError(
+                    "bitsandbytes could not be loaded. "
+                    "4-bit quantization (--quantization bnb_4bit) is unavailable. "
+                    "Use --quantization none, or see WINDOWS_ROCM.md for setup instructions."
+                )
             # BitsAndBytesConfig expects a torch.dtype, not a string.
             if dtype == "auto":
                 compute_dtype = torch.bfloat16
@@ -260,6 +333,12 @@ class Model:
                 bnb_4bit_compute_dtype=compute_dtype,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
+                llm_int8_skip_modules=[
+                    "embed_tokens",
+                    "lm_head",
+                    "embed_vision",
+                    "embed_audio",
+                ],
             )
         return None
 
@@ -280,14 +359,17 @@ class Model:
 
             # Load base model in full precision on CPU to avoid VRAM issues
             print("* Loading base model on CPU (this may take a while)...")
-            base_model = get_model_class(self.settings.model).from_pretrained(
-                self.settings.model,
+            base_model = get_model_class(
+                self.model_path, self.gguf_kwargs.get("gguf_file")
+            ).from_pretrained(
+                self.model_path,
                 torch_dtype=self.model.dtype,
                 device_map="cpu",
                 trust_remote_code=True
                 if self.settings.model in self.trusted_models
                 else None,
                 **self.revision_kwargs,
+                **self.gguf_kwargs,
             )
 
             # Apply LoRA adapters to the CPU model
@@ -328,7 +410,7 @@ class Model:
         if self.model is not None:
             current_model = getattr(self.model.config, "name_or_path", None)
 
-        if current_model == self.settings.model and not self.needs_reload:
+        if current_model == self.model_path and not self.needs_reload:
             # Reset LoRA adapters to zero (identity transformation).
             for name, module in self.model.named_modules():
                 if "lora_B" in name and hasattr(module, "weight"):
@@ -348,15 +430,19 @@ class Model:
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
 
-        self.model = get_model_class(self.settings.model).from_pretrained(
-            self.settings.model,
+        self.model = get_model_class(
+            self.model_path, self.gguf_kwargs.get("gguf_file")
+        ).from_pretrained(
+            self.model_path,
             dtype=self.dtype,
             device_map=self.settings.device_map,
             max_memory=self.max_memory,
+            offload_folder=self.offload_folder,
             trust_remote_code=True
             if self.settings.model in self.trusted_models
             else None,
             **self.revision_kwargs,
+            **self.gguf_kwargs,
             **extra_kwargs,
         )
 
