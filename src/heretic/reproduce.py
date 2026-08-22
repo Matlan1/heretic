@@ -12,6 +12,7 @@ from typing import Any, cast
 from urllib.request import urlopen
 
 import cpuinfo
+import questionary
 import torch
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import (
@@ -19,15 +20,16 @@ from huggingface_hub.utils import (
     disable_progress_bars,
     enable_progress_bars,
 )
-from questionary import Choice
+from questionary import Choice, Style
 from rich.table import Table
 
+from .config import Settings
 from .system import (
     get_accelerator_info_dict,
     get_heretic_version_info,
     get_requirements_dict,
 )
-from .utils import print, prompt_select
+from .utils import ask_if_unset, print
 
 
 def collect_reproducibles(path: str):
@@ -192,7 +194,10 @@ def format_version_information(version_information: dict[str, Any]) -> str:
         return f"{version}-unknown-{random.randint(2**16, 2**17)}"
 
 
-def check_environment(reproduction_information: dict[str, Any]) -> bool:
+def check_environment(
+    settings: Settings,
+    reproduction_information: dict[str, Any],
+) -> bool | None:
     mismatch_severity: MismatchSeverity | None = None
 
     system_mismatches = []
@@ -280,12 +285,10 @@ def check_environment(reproduction_information: dict[str, Any]) -> bool:
 
     else:
         print(
-            (
-                "[yellow]The provided JSON file does not contain system information. "
-                "Some system parameters can affect reproducibility, but due to the lack of system information, "
-                "Heretic is unable to verify that those parameters match the original environment. "
-                "Reproduction may or may not produce a byte-for-byte identical model.[/]"
-            )
+            "[yellow]The provided JSON file does not contain system information. "
+            "Some system parameters can affect reproducibility, but due to the lack of system information, "
+            "Heretic is unable to verify that those parameters match the original environment. "
+            "Reproduction may or may not produce a byte-for-byte identical model.[/]"
         )
 
     requirements = get_requirements_dict()
@@ -316,10 +319,8 @@ def check_environment(reproduction_information: dict[str, Any]) -> bool:
     if system_mismatches or package_mismatches:
         print()
         print(
-            (
-                "[yellow]Your local environment doesn't perfectly match the environment "
-                "used to produce the original model. The following components differ:[/]"
-            )
+            "[yellow]Your local environment doesn't perfectly match the environment "
+            "used to produce the original model. The following components differ:[/]"
         )
 
     if system_mismatches:
@@ -353,30 +354,32 @@ def check_environment(reproduction_information: dict[str, Any]) -> bool:
     if system_mismatches or package_mismatches:
         print()
         print(
-            (
-                f"There is a {cast(MismatchSeverity, mismatch_severity).__rich__()} chance "
-                "that reproduction won't produce a byte-for-byte identical model. "
-                "However, the resulting model will very likely still behave similarly "
-                "to the original model."
-            )
+            f"There is a {cast(MismatchSeverity, mismatch_severity).__rich__()} chance "
+            "that reproduction won't produce a byte-for-byte identical model. "
+            "However, the resulting model will very likely still behave similarly "
+            "to the original model."
         )
 
-        print()
-        choice = prompt_select(
-            "How would you like to proceed?",
-            [
-                Choice(
-                    title="Attempt to reproduce the model anyway",
-                    value=True,
-                ),
-                Choice(
-                    title="Exit program",
-                    value=False,
-                ),
-            ],
-        )
+        if settings.ignore_mismatches is None:
+            print()
 
-        return choice
+        return ask_if_unset(
+            settings.ignore_mismatches,
+            questionary.select(
+                "How would you like to proceed?",
+                choices=[
+                    Choice(
+                        title="Attempt to reproduce the model anyway",
+                        value=True,
+                    ),
+                    Choice(
+                        title="Exit program",
+                        value=False,
+                    ),
+                ],
+                style=Style([("highlighted", "reverse")]),
+            ),
+        )
     else:
         # There are no mismatches at all, so there is nothing to confirm.
         return True

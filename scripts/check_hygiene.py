@@ -46,9 +46,11 @@ _DASHES = (_EM_DASH, _EN_DASH)
 _MAINT_USER = "Mat" + "lan"
 _MAINT_EMAIL = "thei" + "lige" + "@" + "gmail" + "." + "com"
 _DISCLOSURE = [
-    re.compile(re.escape(_MAINT_EMAIL), re.I),
-    re.compile(r"[A-Za-z]:[\\/]Users[\\/]" + _MAINT_USER + r"\b", re.I),  # user dir
-    re.compile(r"[\\/]Users[\\/]" + _MAINT_USER + r"\b"),                 # unix-style
+    re.compile(re.escape(_MAINT_EMAIL), re.IGNORECASE),
+    re.compile(
+        r"[A-Za-z]:[\\/]Users[\\/]" + _MAINT_USER + r"\b", re.IGNORECASE
+    ),  # user dir
+    re.compile(r"[\\/]Users[\\/]" + _MAINT_USER + r"\b"),  # unix-style
     # actual secrets
     re.compile(r"\bghp_[A-Za-z0-9]{20,}"),
     re.compile(r"\bsk-[A-Za-z0-9]{20,}"),
@@ -57,22 +59,53 @@ _DISCLOSURE = [
 ]
 
 # ---- check 3: absolute paths in code/config (escapable) --------------------
-_CODE_EXTS = {".py", ".pyw", ".bat", ".cmd", ".ps1", ".sh", ".toml",
-              ".json", ".cfg", ".ini"}
+_CODE_EXTS = {
+    ".py",
+    ".pyw",
+    ".bat",
+    ".cmd",
+    ".ps1",
+    ".sh",
+    ".toml",
+    ".json",
+    ".cfg",
+    ".ini",
+}
 _ABS_PATH = re.compile(
     r"""(["'(]|\br['"])\s*          # opening quote / r-string
         (?:[A-Za-z]:[\\/]           # Windows drive path
          | /home/ | /Users/ | /mnt/[a-z]/ | /opt/[A-Za-z] )""",
-    re.X,
+    re.VERBOSE,
 )
 
 # directories never scanned
-_SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__", "vendor",
-              "lib"}  # runtime binaries live in lib/ and are gitignored anyway
+_SKIP_DIRS = {
+    ".git",
+    ".venv",
+    "node_modules",
+    "__pycache__",
+    "vendor",
+    "lib",
+}  # runtime binaries live in lib/ and are gitignored anyway
 
-_BINARY_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip",
-                ".dll", ".exe", ".so", ".dylib", ".bin", ".gguf", ".woff",
-                ".woff2", ".ttf"}
+_BINARY_EXTS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".pdf",
+    ".zip",
+    ".dll",
+    ".exe",
+    ".so",
+    ".dylib",
+    ".bin",
+    ".gguf",
+    ".woff",
+    ".woff2",
+    ".ttf",
+}
 
 # This is a fork: the upstream package under src/heretic/ is exempt from the
 # dash and absolute-path heuristics, EXCEPT for these owner-edited files, which
@@ -82,8 +115,9 @@ _OWNER_EDITED_UPSTREAM = {"config.py", "main.py", "model.py", "utils.py"}
 
 def _tracked_files() -> list[Path]:
     try:
-        out = subprocess.run(["git", "ls-files"], cwd=REPO,
-                             capture_output=True, text=True, check=True).stdout
+        out = subprocess.run(
+            ["git", "ls-files"], cwd=REPO, capture_output=True, text=True, check=True
+        ).stdout
     except (subprocess.CalledProcessError, FileNotFoundError):
         return []
     files = []
@@ -101,18 +135,23 @@ def _scan(path: Path) -> list[str]:
     try:
         text = path.read_text(encoding="utf-8")
     except (UnicodeDecodeError, OSError):
-        return []   # binary or unreadable: not our concern here
+        return []  # binary or unreadable: not our concern here
     rel = path.relative_to(REPO).as_posix()
     # Fork exemption: upstream package code is governed by upstream. Skip it
     # entirely, except for the four files this fork has edited.
-    is_upstream = (rel.startswith("src/heretic/")
-                   and Path(rel).name not in _OWNER_EDITED_UPSTREAM)
+    is_upstream = (
+        rel.startswith("src/heretic/") and Path(rel).name not in _OWNER_EDITED_UPSTREAM
+    )
     if is_upstream:
         return []
     # Tests legitimately use synthetic absolute paths as fixtures (fake drive
     # letters, nonexistent dirs, file URLs). The dash and disclosure checks
     # still apply to them; only the absolute-path heuristic is skipped.
-    is_test = rel.startswith("tests/") or "/test_" in "/" + rel or Path(rel).name.startswith("test_")
+    is_test = (
+        rel.startswith("tests/")
+        or "/test_" in "/" + rel
+        or Path(rel).name.startswith("test_")
+    )
     is_code = path.suffix.lower() in _CODE_EXTS and not is_test
     problems = []
     for i, line in enumerate(text.splitlines(), 1):
@@ -124,9 +163,11 @@ def _scan(path: Path) -> list[str]:
             if rx.search(line):
                 problems.append(f"{rel}:{i}: disclosure: {rx.pattern}")
         if is_code and "hygiene-ok" not in line and _ABS_PATH.search(line):
-            problems.append(f"{rel}:{i}: absolute/machine path in code "
-                            "(use a relative path or user config, or mark "
-                            "hygiene-ok if it is a documented example)")
+            problems.append(
+                f"{rel}:{i}: absolute/machine path in code "
+                "(use a relative path or user config, or mark "
+                "hygiene-ok if it is a documented example)"
+            )
     return problems
 
 
